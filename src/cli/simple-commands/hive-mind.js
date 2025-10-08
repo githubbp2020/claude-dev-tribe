@@ -2038,13 +2038,54 @@ async function spawnClaudeCodeInstances(swarmId, swarmName, objective, workers, 
       await writeFile(promptFile, hiveMindPrompt, 'utf8');
       console.log(chalk.green(`\n✓ Hive Mind prompt saved to: ${promptFile}`));
 
-      // Check if claude command exists
+      // Check if claude command exists with improved PowerShell script detection
       const { spawn: childSpawn, execSync } = await import('child_process');
       let claudeAvailable = false;
 
       try {
-        execSync('which claude', { stdio: 'ignore' });
-        claudeAvailable = true;
+        if (process.platform === 'win32') {
+          // For Windows, use PowerShell Get-Command which handles .ps1 scripts
+          try {
+            execSync('powershell -Command "Get-Command claude -ErrorAction SilentlyContinue"', { 
+              stdio: 'ignore', 
+              timeout: 5000 
+            });
+            claudeAvailable = true;
+            console.log(chalk.green('✓ Found Claude CLI via PowerShell detection'));
+          } catch {
+            // Fallback to traditional where command for .exe/.bat files
+            try {
+              execSync('where claude', { stdio: 'ignore', timeout: 5000 });
+              claudeAvailable = true;
+              console.log(chalk.green('✓ Found Claude CLI via where command'));
+            } catch {
+              // Try claude-code as alternative
+              try {
+                execSync('where claude-code', { stdio: 'ignore', timeout: 5000 });
+                claudeAvailable = true;
+                console.log(chalk.green('✓ Found claude-code CLI'));
+              } catch {
+                throw new Error('No Claude CLI found');
+              }
+            }
+          }
+        } else {
+          // Unix/Linux/Mac detection
+          const commands = ['which claude', 'which claude-code'];
+          for (const cmd of commands) {
+            try {
+              execSync(cmd, { stdio: 'ignore', timeout: 5000 });
+              claudeAvailable = true;
+              console.log(chalk.green(`✓ Found Claude CLI with: ${cmd}`));
+              break;
+            } catch {
+              continue;
+            }
+          }
+          if (!claudeAvailable) {
+            throw new Error('No Claude CLI found');
+          }
+        }
       } catch {
         console.log(chalk.yellow('\n⚠️  Claude Code CLI not found in PATH'));
         console.log(chalk.gray('Install it with: npm install -g @anthropic-ai/claude-code'));
@@ -2070,11 +2111,10 @@ async function spawnClaudeCodeInstances(swarmId, swarmName, objective, workers, 
         const isNonInteractive = flags['non-interactive'] || flags.nonInteractive;
         
         // Build arguments in correct order: flags first, then prompt
-        const claudeArgs = [];
+        const claudeArgs = ['--print']; // Keep --print flag to avoid raw mode errors
         
         // Add non-interactive flags FIRST if needed
         if (isNonInteractive) {
-          claudeArgs.push('-p'); // Print mode
           claudeArgs.push('--output-format', 'stream-json'); // JSON streaming  
           claudeArgs.push('--verbose'); // Verbose output
           console.log(chalk.cyan('🤖 Running in non-interactive mode'));
@@ -2092,14 +2132,78 @@ async function spawnClaudeCodeInstances(swarmId, swarmName, objective, workers, 
           }
         }
         
-        // Add the prompt as the LAST argument
-        claudeArgs.push(hiveMindPrompt);
-
-        // Spawn claude with properly ordered arguments
-        const claudeProcess = childSpawn('claude', claudeArgs, {
-          stdio: 'inherit',
-          shell: false,
-        });
+        // Use a temporary script approach to avoid raw mode errors while preserving stdin functionality
+        console.log(chalk.blue('🔍 Debug: Loading hive-mind prompt from file...'));
+        console.log(chalk.gray(`  Prompt file: ${promptFile}`));
+        
+        // Create a temporary script to handle stdin redirection properly
+        const fs = await import('fs');
+        const path = await import('path');
+        const tempDir = path.dirname(promptFile);
+        const tempScriptPath = path.join(tempDir, `claude-launch-${Date.now()}.bat`);
+        
+        // Build Claude command arguments
+        const claudeArgsStr = claudeArgs.join(' ');
+        let claudeProcess;
+        
+        if (process.platform === 'win32') {
+          // Windows: Use PowerShell for proper piping instead of batch file
+          // Clear ANTHROPIC_API_KEY to prevent Claude Code authentication conflicts
+          const powershellCommand = `$env:ANTHROPIC_API_KEY = $null; Get-Content "${promptFile}" | claude ${claudeArgsStr}`;
+          
+          console.log(chalk.blue('🔍 Debug: Launching Claude via PowerShell piping (avoids raw mode errors)'));
+          console.log(chalk.gray(`  PowerShell command: ${powershellCommand.substring(0, 100)}...`));
+          console.log(chalk.yellow('🔧 Clearing ANTHROPIC_API_KEY to prevent authentication conflicts'));
+          console.log(chalk.yellow('⏱️  Timeout protection: 30 seconds'));
+          
+          // Execute using PowerShell with proper stdin handling and timeout
+          claudeProcess = childSpawn('powershell', ['-Command', powershellCommand], {
+            stdio: 'inherit',
+            shell: false,
+          });
+          
+          // Add timeout protection to prevent hanging
+          const timeoutDuration = 30000; // 30 seconds
+          const claudeTimeout = setTimeout(() => {
+            if (claudeProcess && !claudeProcess.killed) {
+              console.log('\n' + chalk.yellow('⏰ Claude Code execution timed out after 30 seconds'));
+              console.log(chalk.yellow('🔄 Terminating process and providing manual instructions...'));
+              claudeProcess.kill('SIGTERM');
+              
+              // Show manual instructions after timeout
+              setTimeout(() => {
+                console.log('\n' + chalk.bold('📋 Manual Execution Instructions:'));
+                console.log(chalk.gray('─'.repeat(50)));
+                console.log(chalk.cyan('1. Clear environment variable and start Claude Code:'));
+                console.log(chalk.white('   $env:ANTHROPIC_API_KEY = $null; claude --print --dangerously-skip-permissions'));
+                console.log(chalk.cyan('\n2. Copy and paste the prompt content:'));
+                console.log(chalk.white(`   Get-Content "${promptFile}"`));
+                console.log(chalk.cyan('\n3. Paste the output into Claude Code when prompted'));
+                console.log(chalk.gray('─'.repeat(50)));
+              }, 100);
+            }
+          }, timeoutDuration);
+          
+          // Clear timeout when process ends normally
+          claudeProcess.on('exit', () => {
+            clearTimeout(claudeTimeout);
+          });
+        } else {
+          // Unix: Create shell script for stdin redirection
+          const shellContent = `#!/bin/bash
+cd "${process.cwd()}"
+cat "${promptFile}" | claude ${claudeArgsStr}
+rm "$0"`;
+          await fs.promises.writeFile(tempScriptPath, shellContent, 'utf8');
+          await fs.promises.chmod(tempScriptPath, '755');
+          
+          console.log(chalk.blue('🔍 Debug: Launching Claude via shell script'));
+          
+          claudeProcess = childSpawn('bash', [tempScriptPath], {
+            stdio: 'inherit',
+            shell: false,
+          });
+        }
 
         // Track child process PID in session
         const sessionManager = new HiveMindSessionManager();
@@ -2170,16 +2274,36 @@ async function spawnClaudeCodeInstances(swarmId, swarmName, objective, workers, 
 
         // Handle process exit
         claudeProcess.on('exit', (code) => {
-          // Remove child PID from session
+          // Remove child PID from session BEFORE closing
           if (sessionId && claudeProcess.pid) {
-            sessionManager.removeChildPid(sessionId, claudeProcess.pid);
-            sessionManager.close();
+            try {
+              sessionManager.removeChildPid(sessionId, claudeProcess.pid);
+            } catch (error) {
+              console.log(chalk.gray('Database connection closed, cannot remove child PID during cleanup'));
+            }
+            
+            try {
+              sessionManager.close();
+            } catch (error) {
+              // Ignore close errors - database might already be closed
+            }
           }
 
           if (code === 0) {
             console.log(chalk.green('\n✓ Claude Code completed successfully'));
           } else if (code !== null) {
             console.log(chalk.red(`\n✗ Claude Code exited with code ${code}`));
+            
+            // Provide manual fallback instructions for failed execution
+            console.log(chalk.yellow('\n🔧 Manual Execution Fallback:'));
+            console.log(chalk.gray('─'.repeat(50)));
+            console.log(chalk.yellow('If Claude Code failed due to environment conflicts, try:'));
+            console.log(chalk.green('1. Clear environment variable and run manually:'));
+            console.log(chalk.green('   $env:ANTHROPIC_API_KEY = $null; claude --print --dangerously-skip-permissions'));
+            console.log(chalk.green('\n2. Then copy and paste the content from:'));
+            console.log(chalk.green(`   Get-Content "${promptFile}"`));
+            console.log(chalk.gray('\n3. Or use piping with cleared environment:'));
+            console.log(chalk.green(`   $env:ANTHROPIC_API_KEY = $null; Get-Content "${promptFile}" | claude --print`));
           }
         });
 
@@ -2228,6 +2352,22 @@ async function spawnClaudeCodeInstances(swarmId, swarmName, objective, workers, 
     spinner.fail('Failed to prepare Claude Code coordination');
     console.error(chalk.red('Error:'), error.message);
   }
+}
+
+/**
+ * Resolve legacy agent types to Claude Code compatible agent types
+ */
+function resolveLegacyAgentType(legacyType) {
+  const LEGACY_AGENT_MAPPING = {
+    analyst: 'code-analyzer',
+    coordinator: 'task-orchestrator', 
+    optimizer: 'perf-analyzer',
+    documenter: 'api-docs',
+    monitor: 'performance-benchmarker',
+    specialist: 'system-architect',
+    architect: 'system-architect',
+  };
+  return LEGACY_AGENT_MAPPING[legacyType] || legacyType;
 }
 
 /**
@@ -2304,7 +2444,7 @@ As the Queen coordinator, you must:
    
    Step 2: REQUIRED - Spawn ACTUAL Agents with Claude Code's Task Tool (Single Message):
    [Claude Code Task Tool - CONCURRENT Agent Execution]:
-   ${workerTypes.map((type) => `   Task("${type.charAt(0).toUpperCase() + type.slice(1)} Agent", "You are a ${type} in the hive. Coordinate via hooks. ${getWorkerTypeInstructions(type).split('\n')[0]}", "${type}")`).join('\n')}
+   ${workerTypes.map((type) => `   Task("${type.charAt(0).toUpperCase() + type.slice(1)} Agent", "You are a ${type} in the hive. Coordinate via hooks. ${getWorkerTypeInstructions(type).split('\n')[0]}", "${resolveLegacyAgentType(type)}")`).join('\n')}
    
    Step 3: Batch ALL Todos Together (Single TodoWrite Call):
    TodoWrite { "todos": [
@@ -3008,8 +3148,49 @@ async function launchClaudeWithContext(prompt, flags, sessionId) {
     let claudeAvailable = false;
 
     try {
-      execSync('which claude', { stdio: 'ignore' });
-      claudeAvailable = true;
+      if (process.platform === 'win32') {
+        // For Windows, use PowerShell Get-Command which handles .ps1 scripts
+        try {
+          execSync('powershell -Command "Get-Command claude -ErrorAction SilentlyContinue"', { 
+            stdio: 'ignore', 
+            timeout: 5000 
+          });
+          claudeAvailable = true;
+          console.log(chalk.green('✓ Found Claude CLI via PowerShell detection'));
+        } catch {
+          // Fallback to traditional where command for .exe/.bat files
+          try {
+            execSync('where claude', { stdio: 'ignore', timeout: 5000 });
+            claudeAvailable = true;
+            console.log(chalk.green('✓ Found Claude CLI via where command'));
+          } catch {
+            // Try claude-code as alternative
+            try {
+              execSync('where claude-code', { stdio: 'ignore', timeout: 5000 });
+              claudeAvailable = true;
+              console.log(chalk.green('✓ Found claude-code CLI'));
+            } catch {
+              throw new Error('No Claude CLI found');
+            }
+          }
+        }
+      } else {
+        // Unix/Linux/Mac detection
+        const commands = ['which claude', 'which claude-code'];
+        for (const cmd of commands) {
+          try {
+            execSync(cmd, { stdio: 'ignore', timeout: 5000 });
+            claudeAvailable = true;
+            console.log(chalk.green(`✓ Found Claude CLI with: ${cmd}`));
+            break;
+          } catch {
+            continue;
+          }
+        }
+        if (!claudeAvailable) {
+          throw new Error('No Claude CLI found');
+        }
+      }
     } catch {
       console.log(chalk.yellow('\n⚠️  Claude Code CLI not found'));
       console.log(chalk.gray('Install Claude Code: npm install -g @anthropic-ai/claude-code'));
@@ -3023,27 +3204,59 @@ async function launchClaudeWithContext(prompt, flags, sessionId) {
       console.log(chalk.gray(`  Session ID: ${sessionId}`));
       console.log(chalk.gray(`  Process ID: ${process.pid}`));
       
-      // Remove --print to allow interactive session (same as initial spawn)
-      const claudeArgs = [prompt];
-
-      // Add --dangerously-skip-permissions by default for hive-mind operations
-      // unless explicitly disabled with --no-auto-permissions
+      // Use a temporary script approach to avoid raw mode errors while preserving stdin functionality  
+      console.log(chalk.blue('🔍 Debug: Loading hive-mind prompt from file...'));
+      console.log(chalk.gray(`  Prompt file: ${promptFile}`));
+      
+      // Build Claude command arguments
+      const claudeBaseArgs = ['--print']; // Keep --print flag to avoid raw mode errors
       if (!flags['no-auto-permissions']) {
-        claudeArgs.push('--dangerously-skip-permissions');
+        claudeBaseArgs.push('--dangerously-skip-permissions');
         console.log(
           chalk.yellow(
             '🔓 Using --dangerously-skip-permissions by default for seamless hive-mind execution',
           ),
         );
       }
-
-      console.log(chalk.blue('🔍 Debug: Spawning with args:'), claudeArgs.slice(0, 1).map(a => a.substring(0, 50) + '...'));
       
-      // Use 'inherit' for interactive session (same as initial spawn)
-      const claudeProcess = childSpawn('claude', claudeArgs, {
-        stdio: 'inherit',
-        shell: false,
-      });
+      // Create a temporary script to handle stdin redirection properly
+      const fs = await import('fs');
+      const path = await import('path');
+      const tempDir = path.dirname(promptFile);
+      const tempScriptPath = path.join(tempDir, `claude-launch-${Date.now()}.bat`);
+      
+      // Build Claude command arguments string
+      const claudeArgsStr = claudeBaseArgs.join(' ');
+      let claudeProcess;
+
+      if (process.platform === 'win32') {
+        // Windows: Use PowerShell for proper piping instead of batch file
+        const powershellCommand = `Get-Content "${promptFile}" | claude ${claudeArgsStr}`;
+        
+        console.log(chalk.blue('🔍 Debug: Launching Claude via PowerShell piping (avoids raw mode errors)'));
+        console.log(chalk.gray(`  PowerShell command: ${powershellCommand.substring(0, 100)}...`));
+        
+        // Execute using PowerShell with proper stdin handling
+        claudeProcess = childSpawn('powershell', ['-Command', powershellCommand], {
+          stdio: 'inherit',
+          shell: false,
+        });
+      } else {
+        // Unix: Create shell script for stdin redirection
+        const shellContent = `#!/bin/bash
+cd "${process.cwd()}"
+cat "${promptFile}" | claude ${claudeArgsStr}
+rm "$0"`;
+        await fs.promises.writeFile(tempScriptPath, shellContent, 'utf8');
+        await fs.promises.chmod(tempScriptPath, '755');
+        
+        console.log(chalk.blue('🔍 Debug: Launching Claude via shell script'));
+        
+        claudeProcess = childSpawn('bash', [tempScriptPath], {
+          stdio: 'inherit',
+          shell: false,
+        });
+      }
       
       console.log(chalk.blue('🔍 Debug: Claude process spawned with PID:'), claudeProcess.pid);
 

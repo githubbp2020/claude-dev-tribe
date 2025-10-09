@@ -2038,13 +2038,28 @@ async function spawnClaudeCodeInstances(swarmId, swarmName, objective, workers, 
       await writeFile(promptFile, hiveMindPrompt, 'utf8');
       console.log(chalk.green(`\n✓ Hive Mind prompt saved to: ${promptFile}`));
 
-      // Check if claude command exists
+      // Check if claude command exists (Windows-compatible)
       const { spawn: childSpawn, execSync } = await import('child_process');
       let claudeAvailable = false;
+      let claudePath = null;
+      let isPS1 = false;
 
       try {
-        execSync('which claude', { stdio: 'ignore' });
+        if (process.platform === 'win32') {
+          // On Windows, use Get-Command to get the actual script path
+          const result = execSync('powershell.exe -Command "Get-Command claude | Select-Object -ExpandProperty Source"', { 
+            stdio: 'pipe', 
+            encoding: 'utf8' 
+          });
+          claudePath = result.trim();
+          isPS1 = claudePath.endsWith('.ps1');
+        } else {
+          // On Unix, use which
+          const result = execSync('which claude', { stdio: 'pipe', encoding: 'utf8' });
+          claudePath = result.trim();
+        }
         claudeAvailable = true;
+        console.log(chalk.green(`✓ Found Claude Code at: ${claudePath}${isPS1 ? ' (PowerShell script)' : ''}`));
       } catch {
         console.log(chalk.yellow('\n⚠️  Claude Code CLI not found in PATH'));
         console.log(chalk.gray('Install it with: npm install -g @anthropic-ai/claude-code'));
@@ -2066,40 +2081,80 @@ async function spawnClaudeCodeInstances(swarmId, swarmName, objective, workers, 
         }
         
         // Check if we should run in non-interactive mode
-        // Respect --non-interactive flag regardless of --claude
-        const isNonInteractive = flags['non-interactive'] || flags.nonInteractive;
+        // Force non-interactive when --execute is used  
+        const isNonInteractive = flags.execute || flags['non-interactive'] || flags.nonInteractive;
         
         // Build arguments in correct order: flags first, then prompt
         const claudeArgs = [];
         
         // Add non-interactive flags FIRST if needed
         if (isNonInteractive) {
-          claudeArgs.push('-p'); // Print mode
-          claudeArgs.push('--output-format', 'stream-json'); // JSON streaming  
-          claudeArgs.push('--verbose'); // Verbose output
+          claudeArgs.push('--print'); // Use --print for non-interactive
           console.log(chalk.cyan('🤖 Running in non-interactive mode'));
         }
 
-        // Add auto-permission flag BEFORE the prompt
-        if (flags['dangerously-skip-permissions'] !== false && !flags['no-auto-permissions']) {
-          claudeArgs.push('--dangerously-skip-permissions');
-          if (!isNonInteractive) {
-            console.log(
-              chalk.yellow(
-                '🔓 Using --dangerously-skip-permissions by default for seamless hive-mind execution',
-              ),
-            );
+        let claudeProcess;
+        console.log(chalk.blue('🚀 Launching Claude Code...'));
+
+        // Handle Windows PowerShell scripts vs direct binaries
+        if (process.platform === 'win32' && isPS1) {
+          console.log(chalk.cyan('🔧 Detected PowerShell script, using PowerShell execution'));
+          console.log(chalk.gray('📝 Clearing ANTHROPIC_API_KEY for child process'));
+          
+          // Use PowerShell to run the script with Get-Content piping
+          const claudeArgs_Escaped = claudeArgs.map(arg => arg.includes(' ') ? `"${arg}"` : arg).join(' ');
+          const psCommand = `$env:ANTHROPIC_API_KEY = $null; Get-Content -Raw "${promptFile}" | & "${claudePath}" ${claudeArgs_Escaped}`;
+          
+          claudeProcess = childSpawn('powershell.exe', ['-Command', psCommand], {
+            stdio: 'inherit',
+            shell: false,
+          });
+        } else {
+          // Direct binary execution with environment clearing and stdin streaming
+          console.log(chalk.cyan('🔧 Using direct binary execution with stdin streaming'));
+          console.log(chalk.gray('📝 Clearing ANTHROPIC_API_KEY for child process'));
+          
+          // Clear ANTHROPIC_API_KEY in child environment
+          const childEnv = { ...process.env };
+          delete childEnv.ANTHROPIC_API_KEY;
+          
+          claudeProcess = childSpawn('claude', claudeArgs, {
+            stdio: ['pipe', 'inherit', 'inherit'],
+            shell: false,
+            env: childEnv,
+          });
+
+          // Stream prompt file to stdin
+          try {
+            const fs = await import('fs');
+            const readStream = fs.createReadStream(promptFile, { encoding: 'utf8' });
+            readStream.pipe(claudeProcess.stdin);
+            readStream.on('end', () => {
+              claudeProcess.stdin.end();
+            });
+          } catch (error) {
+            console.error(chalk.red('Error streaming prompt to Claude:'), error.message);
+            claudeProcess.stdin.end();
           }
         }
-        
-        // Add the prompt as the LAST argument
-        claudeArgs.push(hiveMindPrompt);
 
-        // Spawn claude with properly ordered arguments
-        const claudeProcess = childSpawn('claude', claudeArgs, {
-          stdio: 'inherit',
-          shell: false,
-        });
+        // Add timeout protection
+        const timeoutMs = 30000; // 30 seconds
+        const timeoutId = setTimeout(() => {
+          if (claudeProcess && !claudeProcess.killed) {
+            console.log(chalk.yellow(`\n⏰ Claude Code execution timed out after ${timeoutMs/1000} seconds`));
+            claudeProcess.kill('SIGTERM');
+            
+            // Show manual fallback instructions
+            console.log(chalk.yellow('\n📋 Manual Execution Instructions:'));
+            console.log(chalk.gray('──────────────────────────────────────────────────'));
+            console.log(chalk.cyan('1. Clear environment variable:'));
+            console.log(chalk.white('   $env:ANTHROPIC_API_KEY = $null'));
+            console.log(chalk.cyan('\n2. Run with the saved prompt:'));
+            console.log(chalk.white(`   Get-Content "${promptFile}" | claude --print`));
+            console.log(chalk.cyan('\n3. Or manually copy and paste the prompt into Claude Code'));
+          }
+        }, timeoutMs);
 
         // Track child process PID in session
         const sessionManager = new HiveMindSessionManager();
@@ -2170,6 +2225,9 @@ async function spawnClaudeCodeInstances(swarmId, swarmName, objective, workers, 
 
         // Handle process exit
         claudeProcess.on('exit', (code) => {
+          // Clear timeout
+          clearTimeout(timeoutId);
+          
           // Remove child PID from session
           if (sessionId && claudeProcess.pid) {
             sessionManager.removeChildPid(sessionId, claudeProcess.pid);
